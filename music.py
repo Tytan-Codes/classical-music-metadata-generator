@@ -29,11 +29,7 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.prompt import Prompt, Confirm
 from rich.text import Text
-from rich.box import ROUNDED, DOUBLE, HEAVY
-from rich.layout import Layout
-from rich.live import Live
-from rich import print as rprint
-from rich.markdown import Markdown
+from rich.box import ROUNDED, DOUBLE
 from rich.align import Align
 
 console = Console()
@@ -154,21 +150,35 @@ Filename: {filename}
 Return ONLY valid JSON with these fields (use null if uncertain):
 {{
     "composer": "Last name, First name",
-    "work": "Full work title including catalog number",
-    "movement": "Movement number and name if applicable",
-    "performers": ["Conductor/Performer names"],
+    "composer_short": "Last name only (e.g., Beethoven, Mozart, Chopin)",
+    "work_full": "Full official work title with catalog number (e.g., Piano Concerto No. 2 in B-flat major, Op. 19)",
+    "work_short": "SHORT searchable name that people actually search for (e.g., Piano Concerto No. 2, Symphony No. 5, Nocturne Op. 9 No. 2, Moonlight Sonata)",
+    "movement": "Movement number and name if applicable (e.g., II. Adagio sostenuto)",
+    "movement_name": "Just the movement name without number if exists (e.g., Adagio sostenuto)",
+    "performers": ["Primary performer/conductor names"],
     "orchestra": "Orchestra/Ensemble name",
-    "soloists": ["Soloist names"],
+    "soloists": ["Soloist names with instrument"],
     "date": "Recording year if present",
     "disc": "Disc number if multi-disc",
-    "track": "Track number"
+    "track": "Track number (just the number, e.g., 01, 02, 12)",
+    "suggested_filename": "MUST use work_short NOT work_full! Format: TrackNum - ComposerShort - WorkShort - Movement - Performer"
 }}
 
-Guidelines for classical music:
-- Composer should be "Last, First" format
-- Include catalog numbers (Op., K., BWV, etc.) in work title
-- Separate movement info if it's part of a larger work
-- Identify conductors, orchestras, and soloists
+CRITICAL Guidelines for suggested_filename:
+- ALWAYS use the SHORT searchable work name (work_short), NOT the full official name!
+- Users need to SEARCH for these files - use names people actually search for
+- BAD: "01 - Beethoven - Piano Sonata No. 14 in C-sharp minor, Op. 27 No. 2 - I. Adagio sostenuto - Pollini" (TOO LONG!)
+- GOOD: "01 - Beethoven - Moonlight Sonata - I. Adagio sostenuto - Pollini"
+- BAD: "05 - Mozart - Piano Concerto No. 21 in C major, K. 467 - II. Andante - Uchida"
+- GOOD: "05 - Mozart - Piano Concerto No. 21 - II. Andante - Uchida"
+- Keep filenames SHORT and SEARCHABLE
+- No catalog numbers (Op., K., BWV) in filename - put those in work_full only
+- No key signatures in filename (C major, D minor, etc.)
+
+Other guidelines:
+- Composer should be "Last, First" format, composer_short is just "Last"
+- work_full should include catalog numbers and key for metadata storage
+- work_short should be what people type when searching (simple, memorable names)
 
 {context}"""
 
@@ -353,15 +363,55 @@ def convert_to_flac(file_path):
         return None
 
 
-def apply_metadata_to_flac(file_path, metadata, audio=None):
-    """Apply metadata to FLAC file"""
+def sanitize_filename(filename):
+    """Remove invalid characters from filename"""
+    # Remove characters that are invalid in filenames
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        filename = filename.replace(char, '')
+    # Replace multiple spaces with single space
+    filename = ' '.join(filename.split())
+    # Limit length
+    if len(filename) > 200:
+        filename = filename[:200]
+    return filename.strip()
+
+
+def rename_file(file_path, new_filename):
+    """Rename a file safely, handling conflicts"""
+    file_path = Path(file_path)
+    new_filename = sanitize_filename(new_filename)
+    
+    # Keep the original extension
+    new_path = file_path.parent / f"{new_filename}{file_path.suffix}"
+    
+    # If it's the same name, no need to rename
+    if new_path == file_path:
+        return file_path, False
+    
+    # Handle filename conflicts by adding a number
+    counter = 1
+    while new_path.exists() and new_path != file_path:
+        new_path = file_path.parent / f"{new_filename} ({counter}){file_path.suffix}"
+        counter += 1
+    
+    try:
+        file_path.rename(new_path)
+        return new_path, True
+    except Exception as e:
+        console.print(f"  [red]✗ Error renaming file:[/red] {e}")
+        return file_path, False
+
+
+def apply_metadata_to_flac(file_path, metadata, audio=None, rename=True):
+    """Apply metadata to FLAC file and optionally rename it"""
     try:
         # Use provided audio object or validate the file
         if audio is None:
             is_valid, result = validate_flac_file(file_path)
             if not is_valid:
                 console.print(f"  [yellow]⚠ Invalid FLAC file:[/yellow] {result}")
-                return False
+                return False, file_path
             audio = result
         
         # Clear existing tags
@@ -371,25 +421,52 @@ def apply_metadata_to_flac(file_path, metadata, audio=None):
         if metadata.get('composer'):
             audio['COMPOSER'] = metadata['composer']
         
-        if metadata.get('work'):
-            audio['ALBUM'] = metadata['work']
-            audio['WORK'] = metadata['work']
+        # Use work_full for ALBUM/WORK, fallback to work_short or work
+        work_full = metadata.get('work_full') or metadata.get('work_short') or metadata.get('work')
+        work_short = metadata.get('work_short') or metadata.get('work_full') or metadata.get('work')
         
+        if work_full:
+            audio['ALBUM'] = work_full
+            audio['WORK'] = work_full
+        
+        # Create a searchable TITLE that includes the work name
+        # Format: "Work Short - Movement" for better searchability
+        title_parts = []
+        if work_short:
+            title_parts.append(work_short)
         if metadata.get('movement'):
-            audio['TITLE'] = metadata['movement']
-        elif metadata.get('work'):
-            audio['TITLE'] = metadata['work']
+            title_parts.append(metadata['movement'])
+        
+        if title_parts:
+            # Join with " - " for searchability
+            searchable_title = ' - '.join(title_parts)
+            audio['TITLE'] = searchable_title
+        elif work_full:
+            audio['TITLE'] = work_full
+        
+        # Also store movement separately if present
+        if metadata.get('movement'):
+            audio['MOVEMENT'] = metadata['movement']
         
         if metadata.get('performers'):
-            audio['ARTIST'] = ', '.join(metadata['performers'])
-            audio['ALBUMARTIST'] = ', '.join(metadata['performers'])
+            performers = metadata['performers']
+            if isinstance(performers, list):
+                audio['ARTIST'] = ', '.join(performers)
+                audio['ALBUMARTIST'] = ', '.join(performers)
+            else:
+                audio['ARTIST'] = performers
+                audio['ALBUMARTIST'] = performers
         
         if metadata.get('orchestra'):
             audio['ORCHESTRA'] = metadata['orchestra']
             audio['ENSEMBLE'] = metadata['orchestra']
         
         if metadata.get('soloists'):
-            audio['PERFORMER'] = metadata['soloists']
+            soloists = metadata['soloists']
+            if isinstance(soloists, list):
+                audio['PERFORMER'] = soloists
+            else:
+                audio['PERFORMER'] = [soloists]
         
         if metadata.get('date'):
             audio['DATE'] = str(metadata['date'])
@@ -401,10 +478,19 @@ def apply_metadata_to_flac(file_path, metadata, audio=None):
             audio['TRACKNUMBER'] = str(metadata['track'])
         
         audio.save()
-        return True
+        
+        # Rename file if suggested_filename is provided and rename is enabled
+        new_path = file_path
+        if rename and metadata.get('suggested_filename'):
+            new_path, was_renamed = rename_file(file_path, metadata['suggested_filename'])
+            if was_renamed:
+                console.print(f"  [cyan]📝 Renamed to:[/cyan] {new_path.name}")
+        
+        return True, new_path
     except Exception as e:
         console.print(f"  [red]✗ Error writing metadata:[/red] {e}")
-        return False
+        return False, file_path
+
 
 
 def display_metadata_table(metadata, title="Metadata"):
@@ -508,7 +594,7 @@ def process_folder_normal(folder_path, client, dry_run=False):
                 display_metadata_table(metadata, title="Generated Metadata")
                 
                 if not dry_run:
-                    success = apply_metadata_to_flac(file_path, metadata, result)
+                    success, new_path = apply_metadata_to_flac(file_path, metadata, result)
                     if success:
                         console.print("[green]  ✓ Metadata applied successfully[/green]")
                         processed += 1
@@ -536,7 +622,7 @@ def process_folder_normal(folder_path, client, dry_run=False):
     console.print(summary_table)
 
 
-def process_folder_audit(folder_path, client, dry_run=False):
+def process_folder_audit(folder_path, client, dry_run=False, auto_approve=False):
     """Audit ALL files for metadata consistency and correct if necessary"""
     folder = Path(folder_path)
     
@@ -614,26 +700,68 @@ def process_folder_audit(folder_path, client, dry_run=False):
         new_metadata = get_metadata_from_openrouter(client, filename, context_files, current_metadata)
         
         if new_metadata:
-            # Check if metadata changed significantly
+            # Check if metadata needs improvement
             changes_detected = False
             changes_summary = []
             
-            # Compare key fields
-            comparisons = [
-                ('composer', 'COMPOSER'),
-                ('work', 'ALBUM'),
-                ('movement', 'TITLE'),
-            ]
+            # Get current and new values
+            current_title = str(current_metadata.get('TITLE', '') or '')
+            current_album = str(current_metadata.get('ALBUM', '') or '')
+            current_composer = str(current_metadata.get('COMPOSER', '') or '')
             
-            for new_key, old_key in comparisons:
-                new_val = new_metadata.get(new_key) or ""
-                old_val = current_metadata.get(old_key, "") or ""
-                if isinstance(old_val, list):
-                    old_val = old_val[0] if old_val else ""
-                
-                if new_val and new_val.lower().strip() != str(old_val).lower().strip():
+            new_work_short = new_metadata.get('work_short') or ''
+            new_movement = new_metadata.get('movement') or ''
+            new_composer = new_metadata.get('composer') or ''
+            
+            # Build what the searchable title SHOULD be
+            ideal_title_parts = []
+            if new_work_short:
+                ideal_title_parts.append(new_work_short)
+            if new_movement:
+                ideal_title_parts.append(new_movement)
+            ideal_title = ' - '.join(ideal_title_parts) if ideal_title_parts else ''
+            
+            # Check if current TITLE is already in good searchable format
+            # (contains work name, not just movement)
+            current_title_has_work = False
+            if new_work_short and current_title:
+                # Check if current title contains key parts of work name
+                work_keywords = [w.lower() for w in new_work_short.split() if len(w) > 3]
+                title_lower = current_title.lower()
+                matches = sum(1 for kw in work_keywords if kw in title_lower)
+                if matches >= len(work_keywords) * 0.5:  # At least 50% of keywords match
+                    current_title_has_work = True
+            
+            # Only suggest TITLE change if current title is missing the work name
+            if not current_title_has_work and ideal_title and current_title.lower().strip() != ideal_title.lower().strip():
+                changes_detected = True
+                changes_summary.append(f"  • TITLE: [red]{current_title}[/red] → [green]{ideal_title}[/green]")
+            
+            # Check COMPOSER
+            if new_composer and current_composer.lower().strip() != new_composer.lower().strip():
+                # Only flag if current is empty or significantly different
+                if not current_composer or current_composer.lower() not in new_composer.lower():
                     changes_detected = True
-                    changes_summary.append(f"  • {old_key}: [red]{old_val}[/red] → [green]{new_val}[/green]")
+                    changes_summary.append(f"  • COMPOSER: [red]{current_composer}[/red] → [green]{new_composer}[/green]")
+            
+            # Check if file needs renaming (only if current name is worse than suggested)
+            current_filename = file_path.stem
+            suggested_filename = new_metadata.get('suggested_filename', '')
+            
+            if suggested_filename:
+                # Check if current filename already has good searchable format
+                current_has_work_in_name = False
+                if new_work_short:
+                    work_keywords = [w.lower() for w in new_work_short.split() if len(w) > 3]
+                    filename_lower = current_filename.lower()
+                    matches = sum(1 for kw in work_keywords if kw in filename_lower)
+                    if matches >= len(work_keywords) * 0.5:
+                        current_has_work_in_name = True
+                
+                # Only suggest rename if current filename lacks the work name
+                if not current_has_work_in_name and suggested_filename != current_filename:
+                    changes_detected = True
+                    changes_summary.append(f"  • FILENAME: [red]{current_filename}[/red] → [green]{suggested_filename}[/green]")
             
             if changes_detected:
                 console.print("  [yellow]⚠ Changes recommended:[/yellow]")
@@ -643,8 +771,12 @@ def process_folder_audit(folder_path, client, dry_run=False):
                 display_metadata_table(new_metadata, title="Suggested Metadata")
                 
                 if not dry_run:
-                    if Confirm.ask("  Apply these changes?", default=True):
-                        success = apply_metadata_to_flac(file_path, new_metadata, result)
+                    # Auto-approve or ask for confirmation
+                    should_apply = auto_approve or Confirm.ask("  Apply these changes?", default=True)
+                    if should_apply:
+                        if auto_approve:
+                            console.print("  [cyan]⚡ Auto-applying...[/cyan]")
+                        success, new_path = apply_metadata_to_flac(file_path, new_metadata, result)
                         if success:
                             console.print("  [green]✓ Metadata updated[/green]")
                             updated += 1
@@ -861,14 +993,19 @@ def main():
                 "This will scan [bold]ALL[/bold] files in your library and use AI to:\n"
                 "  • Verify existing metadata is correct and consistent\n"
                 "  • Suggest corrections for incomplete or incorrect entries\n"
-                "  • Standardize formatting (e.g., 'Last, First' for composers)\n\n"
-                "[yellow]Note: You'll be prompted before any changes are made.[/yellow]",
+                "  • Standardize formatting (e.g., 'Last, First' for composers)\n"
+                "  • Rename files to searchable format\n\n"
+                "[yellow]You can choose to auto-approve all changes or review each one.[/yellow]",
                 border_style="magenta"
             ))
             
             if Confirm.ask("Continue with audit?", default=True):
                 dry_run = Confirm.ask("Run in dry-run mode (preview only)?", default=False)
-                process_folder_audit(folder_path, client, dry_run)
+                if not dry_run:
+                    auto_approve = Confirm.ask("[cyan]Auto-approve all changes?[/cyan] (say Yes to apply all without prompting)", default=False)
+                else:
+                    auto_approve = False
+                process_folder_audit(folder_path, client, dry_run, auto_approve)
         
         elif choice == '3':
             # Statistics
