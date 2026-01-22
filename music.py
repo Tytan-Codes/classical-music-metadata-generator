@@ -532,7 +532,8 @@ def process_folder_normal(folder_path, client, dry_run=False):
         return
     
     # Get all FLAC files
-    flac_files = list(folder.rglob('*.flac')) + list(folder.rglob('*.FLAC'))
+    with console.status("[bold green]Scanning for files...[/bold green]"):
+        flac_files = list(folder.rglob('*.flac')) + list(folder.rglob('*.FLAC'))
     
     if not flac_files:
         console.print(Panel(
@@ -646,7 +647,8 @@ def process_folder_audit(folder_path, client, dry_run=False, auto_approve=False)
         return
     
     # Get all FLAC files
-    flac_files = list(folder.rglob('*.flac')) + list(folder.rglob('*.FLAC'))
+    with console.status("[bold green]Scanning for files...[/bold green]"):
+        flac_files = list(folder.rglob('*.flac')) + list(folder.rglob('*.FLAC'))
     
     if not flac_files:
         console.print(Panel(
@@ -980,7 +982,8 @@ def process_cover_art(folder_path, dry_run=False, force_overwrite=False):
         return
 
     # Find all FLAC files directly
-    flac_files = list(folder.rglob("*.flac"))
+    with console.status("[bold green]Scanning for files...[/bold green]"):
+        flac_files = list(folder.rglob("*.flac"))
     
     console.print(Panel(
         f"[bold]Found:[/bold] {len(flac_files)} music files\n"
@@ -1080,7 +1083,8 @@ def show_statistics(folder_path):
         ))
         return
     
-    flac_files = list(folder.rglob('*.flac')) + list(folder.rglob('*.FLAC'))
+    with console.status("[bold green]Scanning for files...[/bold green]"):
+        flac_files = list(folder.rglob('*.flac')) + list(folder.rglob('*.FLAC'))
     
     if not flac_files:
         console.print(Panel(
